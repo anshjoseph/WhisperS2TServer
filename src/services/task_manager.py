@@ -1,141 +1,308 @@
 from models.batch_task import BatchTask, Task
-from typing import List, Dict
-from libs.whisper_model_pool import WhisperModelPool
-from threading import Thread, Event, Lock
+from typing import List, Dict, Optional
+from services.whisper_model_pool import WhisperModelPool
+from threading import Thread, Event, Lock, Condition
 from uuid import uuid4
 import time
 import asyncio
+from queue import Queue, Empty
 from config import get_config
+from utils.log import get_configure_logger
+
+
+logger = get_configure_logger(__file__)
+
+
+class ThreadSafeTaskStorage:
+    """Thread-safe storage for completed tasks with notification support."""
+    
+    def __init__(self):
+        self.__tasks: Dict[str, Task] = {}
+        self.__lock = Lock()
+        self.__condition = Condition(self.__lock)
+        self.__completed_task_ids = set()
+
+    def set(self, task: Task):
+        """Store a completed task and notify waiting threads."""
+        with self.__condition:
+            self.__tasks[task.task_id] = task
+            self.__completed_task_ids.add(task.task_id)
+            self.__condition.notify_all()
+            logger.debug(f"Task {task.task_id} stored and notifications sent")
+
+    def get(self, task_id: str) -> Optional[Task]:
+        """Get a task by ID if it exists."""
+        with self.__lock:
+            return self.__tasks.get(task_id)
+
+    def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> Optional[Task]:
+        """Wait for a specific task to complete with optional timeout."""
+        with self.__condition:
+            # Check if task is already completed
+            if task_id in self.__completed_task_ids:
+                return self.__tasks.get(task_id)
+            
+            # Wait for task completion
+            if self.__condition.wait_for(
+                lambda: task_id in self.__completed_task_ids, 
+                timeout=timeout
+            ):
+                return self.__tasks.get(task_id)
+            return None
+
+    def remove(self, task_id: str):
+        """Remove a task from storage."""
+        with self.__lock:
+            self.__tasks.pop(task_id, None)
+            self.__completed_task_ids.discard(task_id)
+
+    def cleanup_old_tasks(self, max_age_seconds: float = 3600):
+        """Clean up old completed tasks to prevent memory leaks."""
+        current_time = time.time()
+        removed_count = 0
+        
+        with self.__lock:
+            tasks_to_remove = []
+            for task_id, task in self.__tasks.items():
+                # Assuming tasks have a completion_time or using current logic
+                task_age = current_time - getattr(task, 'completion_time', current_time)
+                if task_age > max_age_seconds:
+                    tasks_to_remove.append(task_id)
+            
+            for task_id in tasks_to_remove:
+                self.__tasks.pop(task_id, None)
+                self.__completed_task_ids.discard(task_id)
+                removed_count += 1
+        
+        if removed_count > 0:
+            logger.info(f"Cleaned up {removed_count} old completed tasks")
+        
+        return removed_count
 
 
 class TaskManager:
+    """
+    Manages task batching and processing through WhisperModelPool.
+    Handles async task submission and result retrieval.
+    """
+    
     def __init__(self):
-        self.__pool: WhisperModelPool = WhisperModelPool()
-        self.__tasks: List[Task] = []
-        self.__results: Dict[str, asyncio.Future] = {}
-        self.__lock = Lock()
+        self.__pool = WhisperModelPool(self._batch_completion_hook)
+        self.__completed_tasks = ThreadSafeTaskStorage()
+        self.__pending_queue = Queue()
+        self.__batching_thread: Optional[Thread] = None
+        self.__cleanup_thread: Optional[Thread] = None
+        self.__stop_event = Event()
+        self.__is_running = False
+        self.__config = get_config()
+        
+        # Statistics
+        self.__total_tasks_submitted = 0
+        self.__total_batches_created = 0
+        
+        logger.info(f"TaskManager initialized with batch size: {self.__config.file_batch_size}")
 
-        # Threads
-        self._task_batch_thread = Thread(target=self.task_batching, daemon=True)
-        self._scaler_thread = Thread(target=self.auto_scaler_loop, daemon=True)
-        self._stop_event = Event()
-
-        self._config = get_config()
-
-        # scaling cooldown
-        self._last_scale_time = 0
-        self._scale_cooldown = 5  # seconds
-
-    async def add_task(self, task: Task):
-        """
-        Async version of add_task. Returns a future that resolves
-        when the output of this task is available.
-        """
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        with self.__lock:
-            self.__tasks.append(task)
-            self.__results[str(task.task_id)] = future
-        return await future
-
-    def _task_hook(self, batch: BatchTask):
-        """
-        Hook function called by each WhisperAudioProcessor
-        when a batch completes.
-        Sets the result in the corresponding futures.
-        """
-        for task in batch.tasks:
-            self.set_task_result(str(task.task_id), task.output)
-
-    def set_task_result(self, task_id: str, result: dict):
-        """
-        Sets result for a task future.
-        """
-        with self.__lock:
-            future = self.__results.get(task_id)
-            if future and not future.done():
-                future.set_result(result)
-
-    def _scheduler(self):
-        """Pick a free model from pool."""
-        for proc_id in self.__pool.get_models():
-            stats = self.__pool.get_model_stats(proc_id)
-            if not stats.processing:
-                return proc_id
-        return None
-
-    def task_batching(self):
-        """Continuously pick tasks, batch them, and schedule on models."""
-        while not self._stop_event.is_set():
-            if len(self.__tasks) >= 1:
-                proc_id = self._scheduler()
-                if proc_id is not None:
-                    tasks = []
-                    with self.__lock:
-                        while len(tasks) < self._config.batch_size and self.__tasks:
-                            tasks.append(self.__tasks.pop(0))
-
+    def __batching_task(self):
+        """Background thread that groups tasks into batches and submits them to the pool."""
+        logger.info("Batching thread started")
+        batch_timeout = 0.3  # Max time to wait before submitting partial batch
+        
+        while not self.__stop_event.is_set():
+            try:
+                tasks:List[Task] = []
+                batch_start_time = time.time()
+                
+                # Collect tasks for batching
+                while (len(tasks) < self.__config.file_batch_size and 
+                       (time.time() - batch_start_time) < batch_timeout and
+                       not self.__stop_event.is_set()):
+                    
+                    try:
+                        # Use timeout to avoid blocking indefinitely
+                        task:Task = self.__pending_queue.get(timeout=0.1)
+                       
+                        tasks.append(task)
+                        logger.debug(f"Added task {task.task_id} to batch (batch size: {len(tasks)})")
+                    except Empty:
+                        continue
+                
+                # Submit batch if we have tasks
+                if tasks:
+                    batch_id = str(uuid4())
+                    # for i in range(len(tasks)):
+                    #     tasks[i].metadate
                     batch = BatchTask(
-                        batch_id=uuid4(),
+                        batch_id=batch_id,
                         start_time=time.time(),
-                        end_time=-1,
-                        tasks=tasks,
+                        tasks=tasks
                     )
-                    self.__pool.add_task(proc_id, batch)
+                    
+                    logger.info(f"Submitting batch {batch_id} with {len(tasks)} tasks")
+                    
+                    if self.__pool.add_batch(batch):
+                        self.__total_batches_created += 1
+                        logger.debug(f"Batch {batch_id} successfully submitted to pool")
+                    else:
+                        logger.error(f"Failed to submit batch {batch_id} to pool")
+                        # TODO: Handle batch submission failure (retry, dead letter queue, etc.)
+                
+            except Exception as e:
+                logger.error(f"Error in batching thread: {str(e)}")
+                time.sleep(1)  # Brief pause before continuing
+        
+        logger.info("Batching thread stopped")
 
-            time.sleep(0.2)
+    def __cleanup_task(self):
+        """Background thread for periodic cleanup of old completed tasks."""
+        logger.info("Cleanup thread started")
+        cleanup_interval = 300  # 5 minutes
+        
+        while not self.__stop_event.is_set():
+            try:
+                self.__completed_tasks.cleanup_old_tasks()
+                self.__stop_event.wait(cleanup_interval)
+            except Exception as e:
+                logger.error(f"Error in cleanup thread: {str(e)}")
+                self.__stop_event.wait(60)  # Wait 1 minute before retry
+        
+        logger.info("Cleanup thread stopped")
 
-    def auto_scaler_loop(self):
-        """Monitor load and scale pool."""
-        while not self._stop_event.is_set():
-            self._auto_scale()
-            time.sleep(1)
+    def _batch_completion_hook(self, batch: BatchTask):
+        """Hook called when a batch completes processing."""
+        logger.info(f"Batch {batch.batch_id} completed with {batch.completed_tasks} successful tasks")
+        
+        try:
+            # Store all completed tasks
+            for task in batch.tasks:
+                self.__completed_tasks.set(task)
+                logger.debug(f"Task {task.task_id} marked as completed")
+            
+        except Exception as e:
+            logger.error(f"Error processing batch completion: {str(e)}")
 
-    def _auto_scale(self):
-        if not self._config.enable_auto_scale:
-            return
+    async def submit_task(self, task: Task) -> Task:
+        """
+        Submit a task for processing and wait for completion.
+        
+        Args:
+            task: The task to process
+            
+        Returns:
+            The completed task with results
+            
+        Raises:
+            RuntimeError: If TaskManager is not running
+            TimeoutError: If task doesn't complete within reasonable time
+        """
+        if not self.__is_running:
+            raise RuntimeError("TaskManager is not running. Call start() first.")
+        
+        logger.info(f"Submitting task {task.task_id}")
+        
+        # Add task to pending queue
+        self.__pending_queue.put(task)
+        self.__total_tasks_submitted += 1
+        
+        # Wait for task completion with timeout
+        timeout_seconds = 300  # 5 minutes timeout
+        completed_task = self.__completed_tasks.wait_for_task(task.task_id, timeout_seconds)
+        
+        if completed_task is None:
+            logger.error(f"Task {task.task_id} timed out after {timeout_seconds} seconds")
+            raise TimeoutError(f"Task {task.task_id} did not complete within {timeout_seconds} seconds")
+        
+        logger.info(f"Task {task.task_id} completed successfully")
+        
+        # Clean up the task from storage to prevent memory leaks
+        self.__completed_tasks.remove(task.task_id)
+        
+        return completed_task
 
-        now = time.time()
-        if now - self._last_scale_time < self._scale_cooldown:
-            return
+    def start(self) -> bool:
+        """Start the TaskManager and its background threads."""
+        if self.__is_running:
+            logger.warning("TaskManager is already running")
+            return True
+        
+        logger.info("Starting TaskManager")
+        
+        try:
+            # Start the model pool
+            if not self.__pool.start():
+                logger.error("Failed to start WhisperModelPool")
+                return False
+            
+            # Reset stop event
+            self.__stop_event.clear()
+            
+            # Start background threads
+            self.__batching_thread = Thread(target=self.__batching_task, name="TaskManager-Batching")
+            self.__batching_thread.daemon = True
+            self.__batching_thread.start()
+            
+            self.__cleanup_thread = Thread(target=self.__cleanup_task, name="TaskManager-Cleanup")
+            self.__cleanup_thread.daemon = True
+            self.__cleanup_thread.start()
+            
+            self.__is_running = True
+            logger.info("TaskManager started successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to start TaskManager: {str(e)}")
+            self.stop()  # Clean up any partial initialization
+            return False
 
-        queue_len = len(self.__tasks)
-        pool_size = len(self.__pool.get_models())
+    def stop(self, timeout: float = 30.0) -> bool:
+        """Stop the TaskManager and all background threads."""
+        if not self.__is_running:
+            logger.warning("TaskManager is not running")
+            return True
+        
+        logger.info("Stopping TaskManager")
+        
+        try:
+            # Signal threads to stop
+            self.__stop_event.set()
+            
+            # Wait for batching thread to finish
+            if self.__batching_thread and self.__batching_thread.is_alive():
+                self.__batching_thread.join(timeout=timeout/2)
+                if self.__batching_thread.is_alive():
+                    logger.warning("Batching thread did not stop cleanly")
+            
+            # Wait for cleanup thread to finish
+            if self.__cleanup_thread and self.__cleanup_thread.is_alive():
+                self.__cleanup_thread.join(timeout=timeout/4)
+                if self.__cleanup_thread.is_alive():
+                    logger.warning("Cleanup thread did not stop cleanly")
+            
+            # Stop the model pool
+            pool_stopped = self.__pool.stop(timeout=timeout/2)
+            if not pool_stopped:
+                logger.warning("Model pool did not stop cleanly")
+            
+            self.__is_running = False
+            logger.info("TaskManager stopped")
+            return pool_stopped
+            
+        except Exception as e:
+            logger.error(f"Error stopping TaskManager: {str(e)}")
+            self.__is_running = False
+            return False
 
-        # scale up if overloaded
-        if queue_len > pool_size * self._config.batch_size:
-            if pool_size < self._config.max_auto_scale_limit:
-                self.__pool.add_model(hook=self._task_hook)
-                print(f"[Scaler] Added model instance. Pool size: {len(self.__pool.get_models())}")
+    def get_stats(self) -> Dict:
+        """Get comprehensive TaskManager statistics."""
+        pool_stats = self.__pool.get_pool_stats()
+        
+        return {
+            "is_running": self.__is_running,
+            "total_tasks_submitted": self.__total_tasks_submitted,
+            "total_batches_created": self.__total_batches_created,
+            "pending_queue_size": self.__pending_queue.qsize(),
+            "pool_stats": pool_stats
+        }
 
-        # scale down if idle
-        elif queue_len == 0:
-            busy_models = sum(
-                1 for m in self.__pool.get_models()
-                if self.__pool.get_model_stats(m).processing
-            )
-            if busy_models == 0 and pool_size > self._config.pool_config.size:
-                victim_id = self.__pool.get_models()[-1]
-                self.__pool.close_model(victim_id)
-                print(f"[Scaler] Closed model instance {victim_id}. Pool size: {len(self.__pool.get_models())}")
-
-        self._last_scale_time = now
-
-    def start(self):
-        """Preload min models, then start threads."""
-        min_size = self._config.pool_config.size
-        for _ in range(min_size):
-            self.__pool.add_model(hook=self._task_hook)
-        print(f"[TaskManager] Preloaded {min_size} models in pool.")
-
-        self._task_batch_thread.start()
-        self._scaler_thread.start()
-
-    def stop(self):
-        """Stop TaskManager and close all models in pool."""
-        self._stop_event.set()
-        self._task_batch_thread.join()
-        self._scaler_thread.join()
-
-        self.__pool.close_all()
-        print("[TaskManager] Stopped and all models closed.")
+    def is_running(self) -> bool:
+        """Check if the TaskManager is currently running."""
+        return self.__is_running

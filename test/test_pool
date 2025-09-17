@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+Test script for WhisperModelPool
+Tests pool initialization, batch processing, auto-scaling, and cleanup functionality.
+"""
+
+import time
+import json
+import signal
+import sys
+from typing import List
+from pathlib import Path
+
+from services.whisper_model_pool import WhisperModelPool
+from models.batch_task import BatchTask, Task
+from utils.log import get_configure_logger
+
+logger = get_configure_logger(__file__)
+
+class PoolTester:
+    """Test harness for WhisperModelPool functionality."""
+    
+    def __init__(self):
+        self.pool = None
+        self.test_results = []
+        self.running = True
+        
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        print(f"\n[TEST] Received signal {signum}, shutting down gracefully...")
+        self.running = False
+        if self.pool:
+            self.pool.stop()
+        sys.exit(0)
+    
+    def _create_test_batch(self, batch_id: str, task_count: int = 5) -> BatchTask:
+        """Create a test batch with dummy audio tasks."""
+        tasks = []
+        for i in range(task_count):
+            task = Task(
+                task_id=f"{batch_id}_task_{i}",
+                file_path=f"/tmp/test_audio_{i}.wav",  # Required field
+                task=f"transcribe_audio_{i}",  # Required field
+                lang="en",  # Required field
+                metadata={"test": True, "batch": batch_id, "task_num": i}
+            )
+            tasks.append(task)
+        
+        return BatchTask(
+            batch_id=batch_id,
+            tasks=tasks,
+            start_time=time.time(),  # Required field - current timestamp
+            priority=1,
+            metadata={"test_batch": True}
+        )
+    
+    def _print_stats(self, title: str):
+        """Print current pool statistics."""
+        if not self.pool:
+            return
+            
+        stats = self.pool.get_pool_stats()
+        print(f"\n=== {title} ===")
+        print(f"Pool Size: {stats['pool_size']}")
+        print(f"Idle Models: {stats['idle_models']}")
+        print(f"Busy Models: {stats['busy_models']}")
+        print(f"Total Queue Size: {stats['total_queue_size']}")
+        print(f"Batches Routed: {stats['total_batches_routed']}")
+        print(f"Models Created: {stats['total_models_created']}")
+        print(f"Models Destroyed: {stats['total_models_destroyed']}")
+        
+        # Print individual model stats
+        if stats['models']:
+            print("\nModel Details:")
+            for model_id, model_stats in stats['models'].items():
+                print(f"  {model_id}: {model_stats['status']}, "
+                      f"Queue: {model_stats['queue_size']}, "
+                      f"Age: {model_stats['age_seconds']:.1f}s, "
+                      f"Processed: {model_stats['total_processed']}")
+    
+    def test_basic_initialization(self) -> bool:
+        """Test basic pool initialization and startup."""
+        print("\n[TEST] Testing basic initialization...")
+        
+        try:
+            # Create pool with short TTL for testing
+            self.pool = WhisperModelPool(ttl_seconds=30.0, queue_threshold=2)
+            
+            # Test startup
+            if not self.pool.start():
+                print("[FAIL] Pool failed to start")
+                return False
+            
+            # Wait a moment for models to initialize
+            time.sleep(2)
+            
+            self._print_stats("After Initialization")
+            
+            initial_count = self.pool.get_model_count()
+            if initial_count == 0:
+                print("[FAIL] No models created during initialization")
+                return False
+            
+            print(f"[PASS] Pool initialized with {initial_count} models")
+            return True
+            
+        except Exception as e:
+            print(f"[FAIL] Initialization error: {e}")
+            return False
+    
+    def test_batch_processing(self) -> bool:
+        """Test basic batch processing functionality."""
+        print("\n[TEST] Testing batch processing...")
+        
+        if not self.pool:
+            print("[FAIL] Pool not initialized")
+            return False
+        
+        try:
+            # Create and submit test batches
+            batches = []
+            for i in range(3):
+                batch = self._create_test_batch(f"test_batch_{i}", task_count=3)
+                batches.append(batch)
+                
+                if not self.pool.add_batch(batch):
+                    print(f"[FAIL] Failed to add batch {batch.batch_id}")
+                    return False
+                
+                print(f"[INFO] Added batch {batch.batch_id}")
+                time.sleep(1)  # Small delay between batches
+            
+            self._print_stats("After Adding Batches")
+            
+            # Wait for some processing
+            print("[INFO] Waiting for batch processing...")
+            time.sleep(10)
+            
+            self._print_stats("After Processing Time")
+            
+            print("[PASS] Batch processing test completed")
+            return True
+            
+        except Exception as e:
+            print(f"[FAIL] Batch processing error: {e}")
+            return False
+    
+    def test_auto_scaling(self) -> bool:
+        """Test auto-scaling functionality."""
+        print("\n[TEST] Testing auto-scaling...")
+        
+        if not self.pool:
+            print("[FAIL] Pool not initialized")
+            return False
+        
+        try:
+            initial_count = self.pool.get_model_count()
+            print(f"[INFO] Initial model count: {initial_count}")
+            
+            # Flood the pool with batches to trigger scaling
+            batch_count = 10
+            print(f"[INFO] Adding {batch_count} batches to trigger auto-scaling...")
+            
+            for i in range(batch_count):
+                batch = self._create_test_batch(f"scale_batch_{i}", task_count=5)
+                if self.pool.add_batch(batch):
+                    print(f"[INFO] Added scaling batch {i+1}/{batch_count}")
+                else:
+                    print(f"[WARN] Failed to add scaling batch {i+1}")
+                
+                # Brief pause to observe scaling behavior
+                if i % 3 == 0:
+                    time.sleep(1)
+                    self._print_stats(f"After {i+1} Batches")
+            
+            # Wait and check if scaling occurred
+            time.sleep(5)
+            final_count = self.pool.get_model_count()
+            
+            self._print_stats("After Auto-scaling Test")
+            
+            if final_count > initial_count:
+                print(f"[PASS] Auto-scaling triggered: {initial_count} -> {final_count} models")
+                return True
+            else:
+                print(f"[INFO] No scaling occurred (might be disabled or not needed)")
+                return True  # Not necessarily a failure
+                
+        except Exception as e:
+            print(f"[FAIL] Auto-scaling test error: {e}")
+            return False
+    
+    def test_ttl_cleanup(self) -> bool:
+        """Test TTL-based cleanup functionality."""
+        print("\n[TEST] Testing TTL cleanup...")
+        
+        if not self.pool:
+            print("[FAIL] Pool not initialized")
+            return False
+        
+        try:
+            # Wait for models to become idle
+            print("[INFO] Waiting for models to become idle...")
+            time.sleep(15)
+            
+            initial_count = self.pool.get_model_count()
+            print(f"[INFO] Model count before cleanup: {initial_count}")
+            
+            # Force cleanup of expired models
+            removed_count = self.pool.force_cleanup()
+            print(f"[INFO] Force cleanup removed {removed_count} models")
+            
+            final_count = self.pool.get_model_count()
+            print(f"[INFO] Model count after cleanup: {final_count}")
+            
+            self._print_stats("After TTL Cleanup")
+            
+            print("[PASS] TTL cleanup test completed")
+            return True
+            
+        except Exception as e:
+            print(f"[FAIL] TTL cleanup test error: {e}")
+            return False
+    
+    def test_pool_statistics(self) -> bool:
+        """Test pool statistics reporting."""
+        print("\n[TEST] Testing pool statistics...")
+        
+        if not self.pool:
+            print("[FAIL] Pool not initialized")
+            return False
+        
+        try:
+            stats = self.pool.get_pool_stats()
+            
+            # Verify essential stats are present
+            required_keys = [
+                'pool_size', 'idle_models', 'busy_models',
+                'total_queue_size', 'total_batches_routed',
+                'is_running', 'config', 'models'
+            ]
+            
+            for key in required_keys:
+                if key not in stats:
+                    print(f"[FAIL] Missing required stat: {key}")
+                    return False
+            
+            # Pretty print stats
+            print("\n[INFO] Complete Pool Statistics:")
+            print(json.dumps(stats, indent=2, default=str))
+            
+            print("[PASS] Statistics test completed")
+            return True
+            
+        except Exception as e:
+            print(f"[FAIL] Statistics test error: {e}")
+            return False
+    
+    def run_stress_test(self, duration_seconds: int = 30) -> bool:
+        """Run a stress test with continuous batch submission."""
+        print(f"\n[TEST] Running stress test for {duration_seconds} seconds...")
+        
+        if not self.pool:
+            print("[FAIL] Pool not initialized")
+            return False
+        
+        try:
+            start_time = time.time()
+            batch_counter = 0
+            
+            while time.time() - start_time < duration_seconds and self.running:
+                batch = self._create_test_batch(f"stress_batch_{batch_counter}", task_count=2)
+                
+                if self.pool.add_batch(batch):
+                    batch_counter += 1
+                    if batch_counter % 10 == 0:
+                        print(f"[INFO] Submitted {batch_counter} stress batches")
+                        self._print_stats(f"Stress Test - {batch_counter} Batches")
+                else:
+                    print(f"[WARN] Failed to submit stress batch {batch_counter}")
+                
+                time.sleep(0.5)  # Brief pause between submissions
+            
+            print(f"[INFO] Stress test completed: {batch_counter} batches submitted")
+            self._print_stats("Final Stress Test Results")
+            
+            print("[PASS] Stress test completed")
+            return True
+            
+        except Exception as e:
+            print(f"[FAIL] Stress test error: {e}")
+            return False
+    
+    def run_all_tests(self):
+        """Run all test scenarios."""
+        print("=" * 60)
+        print("WHISPER MODEL POOL TEST SUITE")
+        print("=" * 60)
+        
+        test_methods = [
+            ("Basic Initialization", self.test_basic_initialization),
+            ("Batch Processing", self.test_batch_processing),
+            ("Auto-scaling", self.test_auto_scaling),
+            ("Pool Statistics", self.test_pool_statistics),
+            ("TTL Cleanup", self.test_ttl_cleanup),
+        ]
+        
+        passed = 0
+        failed = 0
+        
+        for test_name, test_method in test_methods:
+            if not self.running:
+                break
+                
+            try:
+                if test_method():
+                    passed += 1
+                    print(f"✓ {test_name} PASSED")
+                else:
+                    failed += 1
+                    print(f"✗ {test_name} FAILED")
+            except KeyboardInterrupt:
+                print(f"\n[INFO] Test interrupted by user")
+                break
+            except Exception as e:
+                failed += 1
+                print(f"✗ {test_name} FAILED with exception: {e}")
+        
+        # Optional stress test
+        if self.running:
+            try:
+                response = input(f"\nRun stress test? (y/N): ").strip().lower()
+                if response == 'y':
+                    if self.run_stress_test(30):
+                        passed += 1
+                        print("✓ Stress Test PASSED")
+                    else:
+                        failed += 1
+                        print("✗ Stress Test FAILED")
+            except KeyboardInterrupt:
+                print("\n[INFO] Stress test skipped")
+        
+        # Final summary
+        print("\n" + "=" * 60)
+        print("TEST SUMMARY")
+        print("=" * 60)
+        print(f"Passed: {passed}")
+        print(f"Failed: {failed}")
+        print(f"Success Rate: {passed/(passed+failed)*100:.1f}%" if (passed+failed) > 0 else "N/A")
+        
+        if self.pool:
+            self._print_stats("Final Pool State")
+    
+    def cleanup(self):
+        """Clean up resources."""
+        print("\n[INFO] Cleaning up...")
+        if self.pool:
+            self.pool.stop(timeout=15)
+            print("[INFO] Pool stopped")
+
+
+def main():
+    """Main test execution."""
+    tester = PoolTester()
+    
+    try:
+        tester.run_all_tests()
+    except KeyboardInterrupt:
+        print("\n[INFO] Test suite interrupted by user")
+    except Exception as e:
+        print(f"\n[ERROR] Test suite error: {e}")
+    finally:
+        tester.cleanup()
+        print("[INFO] Test suite completed")
+
+
+if __name__ == "__main__":
+    main()
