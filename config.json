@@ -1,0 +1,13 @@
+{
+    "gpu_list" : ["cuda:0"],
+    "model_name" : "tiny",
+    "batch_size" : 48,
+    "file_batch_size" : 5,
+    "beam_size" : 5,
+    "enable_auto_scale" : true,
+    "max_auto_scale_limit" : 2,
+    "enable_access_token" : true,
+    "pool_config" : {
+        "size" : 1
+    }
+}
